@@ -183,6 +183,266 @@ def long_tuple_with_one_constrained_position(value: LongBoolTuple) -> int:
 # fmt: on
 ```
 
+## Checks on class pattern attributes
+
+When the subject is always an instance of the pattern class, a failed class pattern tells us that
+one of its subpatterns failed. Later cases only need to cover the remaining attribute values, so
+class patterns that together cover every type of an attribute are exhaustive.
+
+```py
+from dataclasses import dataclass
+
+@dataclass
+class Box:
+    value: int | str
+
+def keyword_patterns(box: Box) -> str:
+    match box:
+        case Box(value=int()):
+            return "int"
+        case Box(value=str()):
+            return "str"
+
+def positional_patterns(box: Box) -> str:
+    match box:
+        case Box(int()):
+            return "int"
+        case Box(str()):
+            return "str"
+
+def non_exhaustive(box: Box | int) -> str:  # error: [invalid-implicit-return]
+    match box:
+        case Box(value=int()):
+            return "int"
+        case Box(value=str()):
+            return "str"
+```
+
+The remaining attribute type is only used to check later patterns. It does not yet narrow the
+subject in later case bodies:
+
+```py
+def narrowing(box: Box) -> None:
+    match box:
+        case Box(value=int()):
+            pass
+        case _:
+            reveal_type(box)  # revealed: Box
+            # TODO: should be `str`
+            reveal_type(box.value)  # revealed: int | str
+```
+
+Each failed case narrows the attribute further:
+
+```py
+@dataclass
+class Scalar:
+    value: int | str | bytes
+
+def three_cases(scalar: Scalar) -> str:
+    match scalar:
+        case Scalar(value=int()):
+            return "int"
+        case Scalar(value=str()):
+            return "str"
+        case Scalar(value=bytes()):
+            return "bytes"
+```
+
+This also applies to literal patterns and to generic classes nested in a union:
+
+```py
+from typing import Generic, Literal, TypeVar, final
+
+T = TypeVar("T")
+
+@dataclass
+class Shape:
+    kind: Literal["circle", "square"]
+
+def literal_attribute(shape: Shape) -> int:
+    match shape:
+        case Shape(kind="circle"):
+            return 1
+        case Shape(kind="square"):
+            return 2
+
+class A: ...
+class B: ...
+
+@final
+@dataclass(frozen=True)
+class Ok(Generic[T]):
+    value: T
+
+@final
+@dataclass(frozen=True)
+class Err(Generic[T]):
+    error: T
+
+def result(value: Ok[int] | Err[A | B]) -> int:
+    match value:
+        case Ok(x):
+            return x
+        case Err(A()):
+            return 1
+        case Err(B()):
+            return 2
+```
+
+A positional subpattern of a built-in class such as `int` matches the subject itself:
+
+```py
+def match_self(value: Literal[0, 1]) -> str:
+    match value:
+        case int(0):
+            return "zero"
+        case int(1):
+            return "one"
+```
+
+A type variable bounded by a union is narrowed through each element of its bound:
+
+```py
+BoxOrInt = TypeVar("BoxOrInt", bound=Box | int)
+
+def bounded_type_variable(value: BoxOrInt) -> str:
+    match value:
+        case Box(value=int()):
+            return "int"
+        case Box(value=str()):
+            return "str"
+        case int():
+            return "bare int"
+```
+
+With several subpatterns, each remaining combination of attribute values must be covered:
+
+```py
+@dataclass
+class Pair:
+    first: bool
+    second: bool
+
+def pair(p: Pair) -> int:
+    match p:
+        case Pair(True, True):
+            return 0
+        case Pair(False, _):
+            return 1
+        case Pair(_, False):
+            return 2
+
+def non_exhaustive_pair(p: Pair) -> int:  # error: [invalid-implicit-return]
+    match p:
+        case Pair(True, True):
+            return 0
+        case Pair(False, True):
+            return 1
+```
+
+A guard can reject a matched value, and an attribute that is not definitely bound can be missing, so
+neither lets later cases rely on the attribute's remaining type:
+
+```py
+def guarded(box: Box, flag: bool) -> str:  # error: [invalid-implicit-return]
+    match box:
+        case Box(value=int()) if flag:
+            return "int"
+        case Box(value=str()):
+            return "str"
+
+def coinflip() -> bool:
+    return True
+
+class MaybeBox:
+    if coinflip():
+        value: int | str = 0
+
+def possibly_unbound(box: MaybeBox) -> str:  # error: [invalid-implicit-return]
+    match box:
+        case MaybeBox(value=int()):
+            return "int"
+        case MaybeBox(value=str()):
+            return "str"
+```
+
+Each case reads the attribute again. A plain attribute keeps its value between cases, but a
+property, `__getattr__`, or a custom `__getattribute__` can return a different value on every read,
+so later cases cannot rely on what an earlier case saw:
+
+```py
+import random
+from typing import Any
+
+class Coin:
+    @property
+    def side(self) -> Literal["heads", "tails"]:
+        return random.choice(["heads", "tails"])
+
+def flip(coin: Coin) -> str:  # error: [invalid-implicit-return]
+    match coin:
+        case Coin(side="heads"):
+            return "heads"
+        case Coin(side="tails"):
+            return "tails"
+
+class Dynamic:
+    def __getattr__(self, name: str) -> int | str:
+        return random.choice([0, ""])
+
+def getattr_fallback(value: Dynamic) -> str:  # error: [invalid-implicit-return]
+    match value:
+        case Dynamic(value=int()):
+            return "int"
+        case Dynamic(value=str()):
+            return "str"
+
+class Intercepted:
+    value: int | str
+
+    def __getattribute__(self, name: str) -> Any:
+        return random.choice([0, ""])
+
+def custom_getattribute(value: Intercepted) -> str:  # error: [invalid-implicit-return]
+    match value:
+        case Intercepted(value=int()):
+            return "int"
+        case Intercepted(value=str()):
+            return "str"
+```
+
+Slot descriptors read directly from instance storage, so they keep their value like plain
+attributes:
+
+```py
+@dataclass(slots=True)
+class Slotted:
+    value: int | str
+
+def slotted(value: Slotted) -> str:
+    match value:
+        case Slotted(value=int()):
+            return "int"
+        case Slotted(value=str()):
+            return "str"
+```
+
+A dynamic attribute type is not narrowed by earlier cases:
+
+```py
+@dataclass
+class AnyBox:
+    value: Any
+
+def dynamic_attribute(box: AnyBox) -> str:  # error: [invalid-implicit-return]
+    match box:
+        case AnyBox(value=int()):
+            return "int"
+        case AnyBox(value=str()):
+            return "str"
+```
+
 ## Checks on enum literals
 
 ```py

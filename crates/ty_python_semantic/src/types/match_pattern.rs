@@ -22,9 +22,9 @@ use crate::types::tuple::TupleType;
 use crate::types::visitor::any_over_type;
 use crate::types::{
     CallableType, ClassBase, ClassLiteral, EnumLiteralType, IntersectionBuilder, IntersectionType,
-    KnownClass, Parameter, Parameters, Signature, SpecialFormType, Type, TypeContext,
-    TypeVarBoundOrConstraints, TypedDictType, UnionType, binding_type, equality_truthiness,
-    infer_same_file_expression_type,
+    KnownClass, MemberLookupPolicy, Parameter, Parameters, Signature, SpecialFormType, Type,
+    TypeContext, TypeVarBoundOrConstraints, TypedDictType, UnionType, binding_type,
+    equality_truthiness, infer_same_file_expression_type,
 };
 
 /// Identifies a pattern by its address and subject type without hashing the pattern subtree.
@@ -577,11 +577,108 @@ fn member_pattern_is_exhaustive<'pattern, 'db>(
     pattern: &'pattern PatternPredicateKind<'db>,
     cache: &mut PatternTypeCache<'pattern, 'db>,
 ) -> bool {
-    let place = instance_ty.member(db, env, name).place;
-    place.is_definitely_bound()
-        && place.raw_type().is_some_and(|member_ty| {
+    definitely_bound_member_type(db, env, instance_ty, name, MemberLookupPolicy::default())
+        .is_some_and(|member_ty| {
             pattern_is_exhaustive_for_subject(db, env, pattern, member_ty, cache)
         })
+}
+
+/// Return the type of `name` on `instance_ty` if the attribute is definitely bound.
+fn definitely_bound_member_type<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    instance_ty: Type<'db>,
+    name: &str,
+    policy: MemberLookupPolicy,
+) -> Option<Type<'db>> {
+    let place = instance_ty
+        .member_lookup_with_policy(db, env, name, policy)
+        .place;
+    if place.is_definitely_bound() {
+        place.raw_type()
+    } else {
+        None
+    }
+}
+
+/// Return the type of `name` on `instance_ty` if reading the attribute in a later `match` case
+/// gives the same value as reading it in an earlier one.
+///
+/// A plain instance or class attribute keeps its value from one case to the next, because the
+/// cases themselves only read attributes, check classes and compare values, which we assume have
+/// no side effects. A property or another descriptor, `__getattr__`, or a custom
+/// `__getattribute__` can instead return a different value on every read:
+///
+/// ```python
+/// class Coin:
+///     @property
+///     def side(self) -> Literal["heads", "tails"]:
+///         return random.choice(["heads", "tails"])
+///
+/// def flip(coin: Coin) -> str:
+///     match coin:
+///         case Coin(side="heads"):
+///             return "heads"
+///         case Coin(side="tails"):  # This can fail too, so the match is not exhaustive.
+///             return "tails"
+/// ```
+///
+/// Slot descriptors read directly from instance storage, so they are as stable as plain
+/// attributes.
+fn stable_member_type<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    instance_ty: Type<'db>,
+    name: &str,
+) -> Option<Type<'db>> {
+    let may_change_between_reads = |receiver: Type<'db>| {
+        let getattribute_policy = MemberLookupPolicy::MRO_NO_OBJECT_FALLBACK
+            | MemberLookupPolicy::META_CLASS_NO_TYPE_FALLBACK;
+        if !receiver
+            .class_member_with_policy(db, env, "__getattribute__", getattribute_policy)
+            .place
+            .is_undefined()
+        {
+            return true;
+        }
+        receiver
+            .class_member(db, env, name)
+            .place
+            .raw_type()
+            .is_some_and(|class_attribute_ty| {
+                !matches!(class_attribute_ty, Type::SlotDescriptor(_))
+                    && !class_attribute_ty
+                        .class_member(db, env, "__get__")
+                        .place
+                        .is_undefined()
+            })
+    };
+
+    // Synthesized protocols, such as the ones that earlier cases intersect with the subject,
+    // describe attribute values rather than descriptors on the runtime class. Their members are
+    // read-only properties, which would otherwise look like descriptors that can change.
+    let is_synthesized_protocol = |ty: &Type<'db>| {
+        ty.as_protocol_instance()
+            .is_some_and(|protocol| protocol.class_origin(db).is_none())
+    };
+    let may_change = match instance_ty {
+        Type::Intersection(intersection) => intersection
+            .iter_positive(db)
+            .filter(|ty| !is_synthesized_protocol(ty))
+            .any(may_change_between_reads),
+        _ => may_change_between_reads(instance_ty),
+    };
+    if may_change {
+        return None;
+    }
+
+    definitely_bound_member_type(
+        db,
+        env,
+        instance_ty,
+        name,
+        MemberLookupPolicy::NO_GETATTR_LOOKUP,
+    )
 }
 
 /// Return whether `pattern` is statically guaranteed to match every value in `subject_ty`.
@@ -1027,7 +1124,7 @@ pub(crate) fn pattern_binding_fallthrough_type<'db>(
     kind: &PatternPredicateKind<'db>,
     subject_ty: Type<'db>,
 ) -> Type<'db> {
-    let mut budget = ExactTuplePatternExpansionBudget::default();
+    let mut budget = PatternExpansionBudget::default();
     try_pattern_binding_fallthrough_type(db, env, kind, subject_ty, &mut budget).unwrap_or_else(
         |()| conservative_pattern_binding_fallthrough_type(db, env, kind, subject_ty),
     )
@@ -1042,11 +1139,14 @@ fn try_pattern_binding_fallthrough_type<'db>(
     env: &ProgramEnvironment<'db>,
     kind: &PatternPredicateKind<'db>,
     subject_ty: Type<'db>,
-    budget: &mut ExactTuplePatternExpansionBudget,
+    budget: &mut PatternExpansionBudget,
 ) -> Result<Type<'db>, ()> {
     match kind {
         PatternPredicateKind::Sequence(sequence) => {
             try_sequence_pattern_binding_fallthrough_type(db, env, sequence, subject_ty, budget)
+        }
+        PatternPredicateKind::Class(class) => {
+            try_class_pattern_binding_fallthrough_type(db, env, kind, class, subject_ty, budget)
         }
         PatternPredicateKind::Or(patterns)
             if let Some(matched) = same_enum_or_pattern_type(db, env, patterns, subject_ty) =>
@@ -1106,24 +1206,13 @@ fn try_sequence_pattern_binding_fallthrough_type<'db>(
     env: &ProgramEnvironment<'db>,
     kind: &SequencePatternPredicateKind<'db>,
     subject_ty: Type<'db>,
-    budget: &mut ExactTuplePatternExpansionBudget,
+    budget: &mut PatternExpansionBudget,
 ) -> Result<Type<'db>, ()> {
     let resolved = subject_ty.resolve_type_alias(db);
     let narrowed = match resolved {
-        Type::Union(union) => {
-            // Wait until every element fits within the expansion budget before simplifying the
-            // union. Otherwise, we can spend substantial time simplifying a partial result that
-            // must be discarded when a later element exceeds the budget.
-            let mapped = union
-                .elements(db)
-                .iter()
-                .map(|element| {
-                    try_sequence_pattern_binding_fallthrough_type(db, env, kind, *element, budget)
-                })
-                .collect::<Result<Vec<_>, ()>>()?;
-            let mut mapped = mapped.into_iter();
-            union.try_map(db, env, |_| mapped.next()).ok_or(())?
-        }
+        Type::Union(union) => try_map_union_elements(db, env, union, |element| {
+            try_sequence_pattern_binding_fallthrough_type(db, env, kind, element, budget)
+        })?,
         Type::Intersection(intersection) => {
             let mut failed = false;
             let narrowed = intersection.map_positive(db, env, |element| {
@@ -1181,17 +1270,213 @@ fn try_sequence_pattern_binding_fallthrough_type<'db>(
     }
 }
 
-const MAX_EXACT_TUPLE_PATTERN_ALTERNATIVES: usize = 64;
-const MAX_EXACT_TUPLE_PATTERN_ELEMENTS: usize = 4_096;
+/// Apply class-pattern binding fallthrough, narrowing the attributes extracted by subpatterns.
+///
+/// When every subject value is an instance of the pattern class, the pattern can only fail
+/// because one of its subpatterns fails. Like exact tuples, the remaining type is a union with one
+/// alternative per subpattern, recording what remains of that subpattern's attribute in a
+/// synthesized protocol.
+///
+/// In the example below, the subject type remaining after the first case is
+/// `Box & <Protocol with members 'value'>`, where `value` is `str`, so the second case is
+/// exhaustive.
+///
+/// ```python
+/// @dataclass
+/// class Box:
+///     value: int | str
+///
+/// def f(box: Box) -> str:
+///     match box:
+///         case Box(value=int()):
+///             return "int"
+///         case Box(value=str()):
+///             return "str"
+/// ```
+///
+/// Unlike the exhaustiveness check for a single case, this relies on the attribute keeping its
+/// value from one case to the next, so it only narrows attributes accepted by
+/// [`stable_member_type`].
+///
+/// Negative narrowing of the subject in later case bodies still subtracts only the definite-match
+/// type of a class pattern. Using this fallthrough there would make the narrowing consistent, but
+/// the protocol intersections would also appear in the displayed type of every subject matched by
+/// several class patterns.
+fn try_class_pattern_binding_fallthrough_type<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    pattern: &PatternPredicateKind<'db>,
+    kind: &ClassPatternPredicateKind<'db>,
+    subject_ty: Type<'db>,
+    budget: &mut PatternExpansionBudget,
+) -> Result<Type<'db>, ()> {
+    // Without subpatterns or a known class, there are no attributes to narrow, so there is no
+    // need to split a union subject into its elements.
+    let class = match class_pattern_coverage_target(db, kind) {
+        Type::ClassLiteral(class) if !kind.is_empty() => class,
+        _ => return Ok(pattern_fallthrough_type(db, env, pattern, subject_ty)),
+    };
 
-/// Limits the cumulative alternatives and element slots created by one pattern traversal.
-#[derive(Default)]
-struct ExactTuplePatternExpansionBudget {
-    alternatives: usize,
-    elements: usize,
+    let resolved = subject_ty.resolve_type_alias(db);
+    let narrowed = match resolved {
+        Type::Union(union) => try_map_union_elements(db, env, union, |element| {
+            try_class_pattern_binding_fallthrough_type(db, env, pattern, kind, element, budget)
+        })?,
+        // A type variable bounded by a union, such as `T: Box | int`, is not a subtype of the
+        // pattern class, but each of its values belongs to an element of the bound.
+        Type::TypeVar(typevar)
+            if let Some(bound @ Type::Union(_)) = typevar.typevar(db).upper_bound(db, env) =>
+        {
+            let remaining =
+                try_class_pattern_binding_fallthrough_type(db, env, pattern, kind, bound, budget)?;
+            if remaining == bound {
+                resolved
+            } else {
+                IntersectionBuilder::new(db, env)
+                    .add_positive(resolved)
+                    .add_positive(remaining)
+                    .build()
+            }
+        }
+        _ => class_instance_pattern_fallthrough_type(
+            db, env, pattern, kind, class, resolved, budget,
+        )?,
+    };
+
+    Ok(if narrowed == resolved {
+        subject_ty
+    } else {
+        narrowed
+    })
 }
 
-impl ExactTuplePatternExpansionBudget {
+/// Return the part of `subject_ty`, which is not a union, that can remain after a class pattern
+/// for `class` fails.
+fn class_instance_pattern_fallthrough_type<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    pattern: &PatternPredicateKind<'db>,
+    kind: &ClassPatternPredicateKind<'db>,
+    class: ClassLiteral<'db>,
+    subject_ty: Type<'db>,
+    budget: &mut PatternExpansionBudget,
+) -> Result<Type<'db>, ()> {
+    let fallthrough = || pattern_fallthrough_type(db, env, pattern, subject_ty);
+
+    let class_instance_ty = Type::instance(db, env, class.top_materialization(db));
+    if !subject_ty.is_subtype_of(db, env, class_instance_ty) {
+        return Ok(fallthrough());
+    }
+
+    let positional_sources =
+        class_pattern_positional_sources(db, env, class, kind.positional.len());
+    let subpatterns =
+        kind.positional
+            .iter()
+            .zip(positional_sources)
+            .chain(kind.keywords.iter().map(|keyword| {
+                (
+                    &keyword.pattern,
+                    ClassPatternPositionalSource::Attribute(keyword.attr.clone()),
+                )
+            }));
+
+    let mut alternatives = Vec::new();
+    for (subpattern, source) in subpatterns {
+        let alternative = match source {
+            ClassPatternPositionalSource::MatchSelf => {
+                let remaining =
+                    try_pattern_binding_fallthrough_type(db, env, subpattern, subject_ty, budget)?;
+                if remaining == subject_ty {
+                    return Ok(fallthrough());
+                }
+                remaining
+            }
+            ClassPatternPositionalSource::Attribute(name) => {
+                let Some(member_ty) = stable_member_type(db, env, subject_ty, name.as_str()) else {
+                    return Ok(fallthrough());
+                };
+                // As with gradual tuple elements, a dynamic attribute type would only carry
+                // `Any & ~int`-style remainders into later cases.
+                if any_over_type(db, env, member_ty, true, |ty| ty.is_dynamic()) {
+                    return Ok(fallthrough());
+                }
+                let remaining =
+                    try_pattern_binding_fallthrough_type(db, env, subpattern, member_ty, budget)?;
+                // If this subpattern can fail for any attribute value, the failure of the class
+                // pattern tells us nothing about the subject.
+                if remaining == member_ty {
+                    return Ok(fallthrough());
+                }
+                if remaining.is_never() {
+                    continue;
+                }
+                IntersectionBuilder::new(db, env)
+                    .add_positive(subject_ty)
+                    .add_positive(Type::protocol_with_readonly_members(
+                        db,
+                        env,
+                        [(name.as_str(), remaining)],
+                    ))
+                    .build()
+            }
+            ClassPatternPositionalSource::Unknown => return Ok(fallthrough()),
+        };
+        if alternative.is_never() {
+            continue;
+        }
+        // Exceeding the limit only loses precision for this class pattern, so fall back locally
+        // instead of discarding tuple expansions elsewhere in the traversal.
+        if !budget.add_class_alternative() {
+            return Ok(fallthrough());
+        }
+        alternatives.push(alternative);
+    }
+
+    Ok(UnionType::from_elements(db, env, alternatives))
+}
+
+/// Map every element of `union` within the expansion budget, then rebuild the union.
+///
+/// Wait until every element fits within the expansion budget before simplifying the union.
+/// Otherwise, we can spend substantial time simplifying a partial result that must be discarded
+/// when a later element exceeds the budget.
+fn try_map_union_elements<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    union: UnionType<'db>,
+    mut map: impl FnMut(Type<'db>) -> Result<Type<'db>, ()>,
+) -> Result<Type<'db>, ()> {
+    let mapped = union
+        .elements(db)
+        .iter()
+        .map(|element| map(*element))
+        .collect::<Result<Vec<_>, ()>>()?;
+    let mut mapped = mapped.into_iter();
+    union.try_map(db, env, |_| mapped.next()).ok_or(())
+}
+
+const MAX_EXACT_TUPLE_PATTERN_ALTERNATIVES: usize = 64;
+const MAX_EXACT_TUPLE_PATTERN_ELEMENTS: usize = 4_096;
+const MAX_CLASS_PATTERN_ALTERNATIVES: usize = 64;
+
+/// Limits the cumulative alternatives created by one pattern traversal.
+///
+/// Exact tuples and class patterns are counted separately, so that class patterns cannot use up
+/// the tuple limit.
+#[derive(Default)]
+struct PatternExpansionBudget {
+    alternatives: usize,
+    elements: usize,
+    class_alternatives: usize,
+}
+
+impl PatternExpansionBudget {
+    fn add_class_alternative(&mut self) -> bool {
+        self.class_alternatives += 1;
+        self.class_alternatives <= MAX_CLASS_PATTERN_ALTERNATIVES
+    }
+
     fn add_alternative(&mut self, elements: usize) -> Result<(), ()> {
         self.alternatives += 1;
         self.elements = self.elements.saturating_add(elements);
@@ -1215,7 +1500,7 @@ fn exact_tuple_sequence_pattern_fallthrough_type<'db>(
     env: &ProgramEnvironment<'db>,
     kind: &SequencePatternPredicateKind<'db>,
     subject_ty: Type<'db>,
-    budget: &mut ExactTuplePatternExpansionBudget,
+    budget: &mut PatternExpansionBudget,
 ) -> Result<Option<Type<'db>>, ()> {
     if kind.split_around_star().is_some() {
         return Ok(None);
